@@ -11,3 +11,5 @@ services:
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
       OLLAMA_BASE_URL: "http://ollama:11434"
       OLLAMA_MODEL: "llama3.1"
+    volumes:
+      - ./data:/var/lib/ollamabot
