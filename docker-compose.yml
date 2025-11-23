@@ -11,3 +11,8 @@ services:
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
       OLLAMA_BASE_URL: "http://ollama:11434"
       OLLAMA_MODEL: "llama3.1"
+      BOT_AUTH_ENABLED: "true"
+      BOT_ADMIN_ID: "123456789"  # change to your Telegram ID
+      BOT_AUTH_DB_PATH: "/var/lib/ollamabot/bot_users.db"
+    volumes:
+      - ./data:/var/lib/ollamabot
