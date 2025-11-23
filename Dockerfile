@@ -19,6 +19,9 @@ RUN apk add --no-cache ca-certificates tzdata && \
 
 WORKDIR /app
 
+RUN mkdir -p /var/lib/ollamabot && \
+    chown -R root:root /var/lib/ollamabot
+
 COPY --from=builder /app/telegram-ollama-bot /usr/local/bin/telegram-ollama-bot
 
 ENV OLLAMA_BASE_URL="http://ollama:11434" \
