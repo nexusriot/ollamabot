@@ -202,6 +202,24 @@ func (s *UserStore) ListUsers(limit int) ([]DBUser, error) {
 	return res, nil
 }
 
+// -------- Typing progress helper --------
+
+// sendTypingUntilDone periodically sends "typing" action until done is closed.
+func sendTypingUntilDone(bot *tgbotapi.BotAPI, chatID int64, done <-chan struct{}) {
+	ticker := time.NewTicker(4 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			// best-effort, ignore errors
+			_, _ = bot.Send(tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping))
+		}
+	}
+}
+
 // -------- Main --------
 
 func main() {
@@ -389,19 +407,33 @@ func main() {
 				_, _ = bot.Send(msg)
 			} else {
 				msg := tgbotapi.NewMessage(chatID,
-					fmt.Sprintf("Current model: `%s`\nUsage: `/model llama3.1`", model))
+					fmt.Sprintf("Current model: `%s`\\nUsage: `/model llama3.1`", model))
 				msg.ParseMode = "Markdown"
 				_, _ = bot.Send(msg)
 			}
 			continue
 		}
 
-		// Acknowledge user
+		// Initial typing indicator
 		typing := tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping)
 		_, _ = bot.Send(typing)
 
-		go func(chatID int64, text string) {
-			reply, err := callOllama(ollamaBaseURL, model, text)
+		// capture current model so user changing /model later
+		// doesn't affect this request mid-flight
+		currentModel := model
+
+		// Handle Ollama call in background with progress "typing..."
+		go func(chatID int64, text, modelForCall string) {
+			done := make(chan struct{})
+
+			// progress goroutine
+			go sendTypingUntilDone(bot, chatID, done)
+
+			reply, err := callOllama(ollamaBaseURL, modelForCall, text)
+
+			// stop typing loop
+			close(done)
+
 			if err != nil {
 				log.Printf("ollama error: %v", err)
 				msg := tgbotapi.NewMessage(chatID, "⚠️ Error from backend: "+err.Error())
@@ -418,7 +450,7 @@ func main() {
 				_, _ = bot.Send(msg)
 				time.Sleep(300 * time.Millisecond)
 			}
-		}(chatID, text)
+		}(chatID, text, currentModel)
 	}
 }
 
