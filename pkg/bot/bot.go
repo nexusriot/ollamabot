@@ -38,14 +38,22 @@ type Bot struct {
 	userStore     *auth.UserStore
 	ollamaBaseURL string
 	model         string
+	httpClient    *http.Client
 }
 
-func NewBot(api *tgbotapi.BotAPI, userStore *auth.UserStore, ollamaBaseURL, model string) *Bot {
+func NewBot(api *tgbotapi.BotAPI, userStore *auth.UserStore, ollamaBaseURL, model string, timeout time.Duration) *Bot {
+	if timeout <= 0 {
+		timeout = 120 * time.Second
+	}
+
 	return &Bot{
 		api:           api,
 		userStore:     userStore,
 		ollamaBaseURL: strings.TrimRight(ollamaBaseURL, "/"),
 		model:         model,
+		httpClient: &http.Client{
+			Timeout: timeout,
+		},
 	}
 }
 
@@ -299,11 +307,22 @@ func (b *Bot) callOllama(model, prompt string) (string, error) {
 	}
 
 	url := b.ollamaBaseURL + "/api/chat"
-	resp, err := http.Post(url, "application/json", bytes.NewReader(data))
+
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
-		return "", fmt.Errorf("http post: %w", err)
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	start := time.Now()
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		// Typically "context deadline exceeded (Client.Timeout exceeded...)" on timeout
+		return "", fmt.Errorf("http request: %w", err)
 	}
 	defer resp.Body.Close()
+
+	log.Printf("Ollama call to %s took %s, status=%d", url, time.Since(start), resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
 		var buf bytes.Buffer
