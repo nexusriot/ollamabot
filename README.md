@@ -36,10 +36,12 @@ Built in Go, deployable with Docker, and optionally locked down with SQLite-base
 | `TELEGRAM_BOT_TOKEN` | Bot token from BotFather |
 
 ### Optional (Ollama)
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OLLAMA_BASE_URL` | `http://ollama:11434` | Ollama API base URL |
-| `OLLAMA_MODEL` | *(empty)* | Default model for chats |
+| Variable | Default               | Description             |
+|----------|-----------------------|-------------------------|
+| `OLLAMA_BASE_URL` | `http://ollama:11434` | Ollama API base URL     |
+| `OLLAMA_MODEL` | *(empty)*             | Default model for chats |
+| `OLLAMA_TIMEOUT_SECONDS` | 180                   | Ollama request timeout  |
+| `OLLAMA_STREAM` | false                 | Use Ollama stream       |
 
 ### Optional (Authentication)
 Authentication is **disabled by default**.

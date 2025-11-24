@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -39,9 +40,10 @@ type Bot struct {
 	ollamaBaseURL string
 	model         string
 	httpClient    *http.Client
+	stream        bool
 }
 
-func NewBot(api *tgbotapi.BotAPI, userStore *auth.UserStore, ollamaBaseURL, model string, timeout time.Duration) *Bot {
+func NewBot(api *tgbotapi.BotAPI, userStore *auth.UserStore, ollamaBaseURL, model string, timeout time.Duration, stream bool) *Bot {
 	if timeout <= 0 {
 		timeout = 120 * time.Second
 	}
@@ -54,6 +56,7 @@ func NewBot(api *tgbotapi.BotAPI, userStore *auth.UserStore, ollamaBaseURL, mode
 		httpClient: &http.Client{
 			Timeout: timeout,
 		},
+		stream: stream,
 	}
 }
 
@@ -158,14 +161,23 @@ func (b *Bot) Run() {
 		currentModel := b.model
 		prompt := text
 
-		// Handle Ollama call in background with progress "typing..."
+		// Handle Ollama call in background (with typing progress)
 		go func(chatID int64, prompt, modelForCall string) {
 			done := make(chan struct{})
 
 			// progress goroutine
 			go b.sendTypingUntilDone(chatID, done)
 
-			reply, err := b.callOllama(modelForCall, prompt)
+			var (
+				reply string
+				err   error
+			)
+
+			if b.stream {
+				reply, err = b.callOllamaStream(modelForCall, prompt)
+			} else {
+				reply, err = b.callOllama(modelForCall, prompt)
+			}
 
 			// stop typing loop
 			close(done)
@@ -317,12 +329,12 @@ func (b *Bot) callOllama(model, prompt string) (string, error) {
 	start := time.Now()
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
-		// Typically "context deadline exceeded (Client.Timeout exceeded...)" on timeout
 		return "", fmt.Errorf("http request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	log.Printf("Ollama call to %s took %s, status=%d", url, time.Since(start), resp.StatusCode)
+	log.Printf("Ollama (non-stream) call to %s took %s, status=%d",
+		url, time.Since(start), resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
 		var buf bytes.Buffer
@@ -339,6 +351,85 @@ func (b *Bot) callOllama(model, prompt string) (string, error) {
 	}
 
 	return strings.TrimSpace(oresp.Message.Content), nil
+}
+
+func (b *Bot) callOllamaStream(model, prompt string) (string, error) {
+	reqBody := OllamaChatRequest{
+		Model: model,
+		Messages: []OllamaMessage{
+			{
+				Role: "user",
+				Content: prompt + "\n\n" +
+					"Please answer in Markdown. Use fenced code blocks (```lang ... ```).",
+			},
+		},
+		Stream: true,
+	}
+
+	data, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal request: %w", err)
+	}
+
+	url := b.ollamaBaseURL + "/api/chat"
+
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	start := time.Now()
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("http request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	log.Printf("Ollama (stream) call to %s started, status=%d", url, resp.StatusCode)
+
+	if resp.StatusCode != http.StatusOK {
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(resp.Body)
+		return "", fmt.Errorf("ollama HTTP %d: %s", resp.StatusCode, buf.String())
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	// allow larger chunks
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	var full strings.Builder
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		var chunk OllamaChatResponse
+		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
+			log.Printf("error decoding streaming chunk: %v; line=%q", err, line)
+			continue
+		}
+
+		if chunk.Error != "" {
+			return "", fmt.Errorf("ollama error: %s", chunk.Error)
+		}
+		if chunk.Message.Content != "" {
+			full.WriteString(chunk.Message.Content)
+		}
+		if chunk.Done {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read stream: %w", err)
+	}
+
+	log.Printf("Ollama (stream) call to %s finished in %s", url, time.Since(start))
+
+	return strings.TrimSpace(full.String()), nil
 }
 
 func splitTelegramMessage(s string, max int) []string {
