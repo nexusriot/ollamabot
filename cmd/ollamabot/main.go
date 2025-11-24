@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
@@ -46,6 +47,31 @@ func readAuthConfigFromEnv() (auth.AuthConfig, error) {
 	return cfg, nil
 }
 
+func readOllamaTimeoutFromEnv() time.Duration {
+	// Default: 180 seconds
+	const defaultTimeout = 180 * time.Second
+
+	val := os.Getenv("OLLAMA_TIMEOUT_SECONDS")
+	if val == "" {
+		return defaultTimeout
+	}
+
+	sec, err := strconv.Atoi(val)
+	if err != nil || sec <= 0 {
+		log.Printf("Invalid OLLAMA_TIMEOUT_SECONDS=%q, using default %s", val, defaultTimeout)
+		return defaultTimeout
+	}
+
+	return time.Duration(sec) * time.Second
+}
+
+func readOllamaStreamFromEnv() bool {
+	val := os.Getenv("OLLAMA_STREAM")
+	return strings.EqualFold(val, "1") ||
+		strings.EqualFold(val, "true") ||
+		strings.EqualFold(val, "yes")
+}
+
 func main() {
 	telegramToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	if telegramToken == "" {
@@ -58,6 +84,10 @@ func main() {
 	}
 
 	model := os.Getenv("OLLAMA_MODEL")
+
+	ollamaTimeout := readOllamaTimeoutFromEnv()
+	stream := readOllamaStreamFromEnv()
+	log.Printf("Using Ollama timeout: %s, streaming: %v", ollamaTimeout, stream)
 
 	// Read auth config from env
 	authCfg, err := readAuthConfigFromEnv()
@@ -80,7 +110,6 @@ func main() {
 	botAPI.Debug = false
 	log.Printf("Authorized on account %s", botAPI.Self.UserName)
 
-	// Create and run bot
-	bot := bot.NewBot(botAPI, userStore, ollamaBaseURL, model)
-	bot.Run()
+	b := bot.NewBot(botAPI, userStore, ollamaBaseURL, model, ollamaTimeout, stream)
+	b.Run()
 }
