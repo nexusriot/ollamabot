@@ -2,7 +2,10 @@ module github.com/nexusriot/ollamabot
 
 go 1.24.6
 
-require github.com/go-telegram-bot-api/telegram-bot-api/v5 v5.5.1
+require (
+	github.com/go-telegram-bot-api/telegram-bot-api/v5 v5.5.1
+	modernc.org/sqlite v1.40.1
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -15,5 +18,4 @@ require (
 	modernc.org/libc v1.66.10 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.40.1 // indirect
 )
