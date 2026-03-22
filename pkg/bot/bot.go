@@ -76,6 +76,207 @@ func (b *Bot) sendTypingUntilDone(chatID int64, done <-chan struct{}) {
 	}
 }
 
+func (b *Bot) streamOllamaToTelegramHybrid(chatID int64, model, prompt string) error {
+	reqBody := OllamaChatRequest{
+		Model: model,
+		Messages: []OllamaMessage{
+			{
+				Role:    "user",
+				Content: prompt,
+			},
+		},
+		Stream: true,
+	}
+
+	data, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	url := b.ollamaBaseURL + "/api/chat"
+
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("http request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(resp.Body)
+		return fmt.Errorf("ollama HTTP %d: %s", resp.StatusCode, buf.String())
+	}
+
+	// placeholder message - will be edited
+	placeholder := tgbotapi.NewMessage(chatID, "…")
+	sentMsg, err := b.api.Send(placeholder)
+	if err != nil {
+		return fmt.Errorf("send placeholder: %w", err)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	var full strings.Builder
+	lastEdit := time.Now()
+	lastSent := ""
+
+	flush := func(force bool) error {
+		text := strings.TrimSpace(full.String())
+		if text == "" {
+			text = "…"
+		}
+
+		// Telegram limit
+		runes := []rune(text)
+		if len(runes) > 4096 {
+			text = string(runes[:4096])
+		}
+
+		if !force {
+			if time.Since(lastEdit) < 700*time.Millisecond {
+				return nil
+			}
+			if text == lastSent {
+				return nil
+			}
+		}
+
+		edit := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, text)
+		edit.DisableWebPagePreview = true
+
+		if _, err := b.api.Send(edit); err != nil {
+			return err
+		}
+
+		lastEdit = time.Now()
+		lastSent = text
+		return nil
+	}
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		var chunk OllamaChatResponse
+		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
+			continue
+		}
+
+		if chunk.Error != "" {
+			return fmt.Errorf("ollama error: %s", chunk.Error)
+		}
+
+		if chunk.Message.Content != "" {
+			full.WriteString(chunk.Message.Content)
+			_ = flush(false)
+		}
+
+		if chunk.Done {
+			break
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	// final flush
+	_ = flush(true)
+
+	fullText := strings.TrimSpace(full.String())
+
+	//  formatted message
+	b.sendFinalMarkdown(chatID, fullText)
+
+	del := tgbotapi.NewDeleteMessage(chatID, sentMsg.MessageID)
+	_, _ = b.api.Request(del)
+
+	return nil
+}
+
+func escapeTelegramMarkdownV2Smart(s string) string {
+	var result strings.Builder
+
+	inCodeBlock := false
+	lines := strings.Split(s, "\n")
+
+	for i, line := range lines {
+		trim := strings.TrimSpace(line)
+
+		// toggle code block
+		if strings.HasPrefix(trim, "```") {
+			inCodeBlock = !inCodeBlock
+			result.WriteString(line)
+		} else if inCodeBlock {
+			// inside code block → DO NOT escape
+			result.WriteString(line)
+		} else {
+			// normal text → escape
+			result.WriteString(escapeTelegramMarkdownV2(line))
+		}
+
+		if i < len(lines)-1 {
+			result.WriteString("\n")
+		}
+	}
+
+	return result.String()
+}
+
+func (b *Bot) sendFinalMarkdown(chatID int64, text string) {
+	escaped := escapeTelegramMarkdownV2Smart(text)
+
+	parts := splitTelegramMessage(escaped, 4000)
+
+	for i, part := range parts {
+		msg := tgbotapi.NewMessage(chatID, part)
+		msg.ParseMode = "MarkdownV2"
+		msg.DisableWebPagePreview = true
+
+		_, err := b.api.Send(msg)
+		if err != nil {
+			log.Printf("final markdown send error: %v", err)
+		}
+
+		if i < len(parts)-1 {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+}
+
+func escapeTelegramMarkdownV2(s string) string {
+	replacer := strings.NewReplacer(
+		"_", "\\_",
+		"*", "\\*",
+		"[", "\\[",
+		"]", "\\]",
+		"(", "\\(",
+		")", "\\)",
+		"~", "\\~",
+		"`", "\\`",
+		">", "\\>",
+		"#", "\\#",
+		"+", "\\+",
+		"-", "\\-",
+		"=", "\\=",
+		"|", "\\|",
+		"{", "\\{",
+		"}", "\\}",
+		".", "\\.",
+		"!", "\\!",
+	)
+	return replacer.Replace(s)
+}
+
 func (b *Bot) Run() {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
@@ -164,24 +365,21 @@ func (b *Bot) Run() {
 		// Handle Ollama call in background (with typing progress)
 		go func(chatID int64, prompt, modelForCall string) {
 			done := make(chan struct{})
-
-			// progress goroutine
 			go b.sendTypingUntilDone(chatID, done)
 
-			var (
-				reply string
-				err   error
-			)
+			defer close(done)
 
 			if b.stream {
-				reply, err = b.callOllamaStream(modelForCall, prompt)
-			} else {
-				reply, err = b.callOllama(modelForCall, prompt)
+				err := b.streamOllamaToTelegramHybrid(chatID, modelForCall, prompt)
+				if err != nil {
+					log.Printf("stream error: %v", err)
+					msg := tgbotapi.NewMessage(chatID, "⚠️ Error: "+err.Error())
+					_, _ = b.api.Send(msg)
+				}
+				return
 			}
 
-			// stop typing loop
-			close(done)
-
+			reply, err := b.callOllama(modelForCall, prompt)
 			if err != nil {
 				log.Printf("ollama error: %v", err)
 				msg := tgbotapi.NewMessage(chatID, "⚠️ Error from backend: "+err.Error())
@@ -351,85 +549,6 @@ func (b *Bot) callOllama(model, prompt string) (string, error) {
 	}
 
 	return strings.TrimSpace(oresp.Message.Content), nil
-}
-
-func (b *Bot) callOllamaStream(model, prompt string) (string, error) {
-	reqBody := OllamaChatRequest{
-		Model: model,
-		Messages: []OllamaMessage{
-			{
-				Role: "user",
-				Content: prompt + "\n\n" +
-					"Please answer in Markdown. Use fenced code blocks (```lang ... ```).",
-			},
-		},
-		Stream: true,
-	}
-
-	data, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("marshal request: %w", err)
-	}
-
-	url := b.ollamaBaseURL + "/api/chat"
-
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
-	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	start := time.Now()
-	resp, err := b.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("http request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	log.Printf("Ollama (stream) call to %s started, status=%d", url, resp.StatusCode)
-
-	if resp.StatusCode != http.StatusOK {
-		var buf bytes.Buffer
-		_, _ = buf.ReadFrom(resp.Body)
-		return "", fmt.Errorf("ollama HTTP %d: %s", resp.StatusCode, buf.String())
-	}
-
-	scanner := bufio.NewScanner(resp.Body)
-	// allow larger chunks
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-
-	var full strings.Builder
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-
-		var chunk OllamaChatResponse
-		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
-			log.Printf("error decoding streaming chunk: %v; line=%q", err, line)
-			continue
-		}
-
-		if chunk.Error != "" {
-			return "", fmt.Errorf("ollama error: %s", chunk.Error)
-		}
-		if chunk.Message.Content != "" {
-			full.WriteString(chunk.Message.Content)
-		}
-		if chunk.Done {
-			break
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("read stream: %w", err)
-	}
-
-	log.Printf("Ollama (stream) call to %s finished in %s", url, time.Since(start))
-
-	return strings.TrimSpace(full.String()), nil
 }
 
 func splitTelegramMessage(s string, max int) []string {
